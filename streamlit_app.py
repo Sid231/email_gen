@@ -95,11 +95,34 @@ def iter_block_items(parent):
             yield Table(child, parent)
 
 
+# Matches "Subject: ...", "SUBJECT - ...", "Sub : ...", "Sub.- ...", "Re: ..." etc.
+# Group 1 is the subject text (may be empty if it sits on the next line).
+SUBJECT_RE = re.compile(
+    r'^\s*(?:(?:subject|sub\.?)\s*[:\-–—]+|re\s*:)\s*(.*)$',
+    re.IGNORECASE | re.DOTALL
+)
+
+
+def clean_text(text):
+    # Word often uses tabs and non-breaking spaces around "Subject :"
+    return re.sub(r'[\s ]+', ' ', text or '').strip()
+
+
+def match_subject(text):
+    """Return subject text if this line is a subject line, else None."""
+    m = SUBJECT_RE.match(clean_text(text))
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
 def extract_subject_and_body(docx_path):
 
     doc = Document(docx_path)
 
     subject = ""
+    subject_found = False
+    subject_pending = False   # "Subject:" label alone, text on the next line
     html_parts = []
 
     for block in iter_block_items(doc):
@@ -109,8 +132,22 @@ def extract_subject_and_body(docx_path):
 
             text = block.text.strip()
 
-            if text.lower().startswith("subject"):
-                subject = text.replace("Subject:", "").strip()
+            # Subject label on its own line -> take the next non-empty line
+            if subject_pending and text:
+                subject = clean_text(text)
+                subject_pending = False
+                continue
+
+            if not subject_found:
+                found = match_subject(text)
+                if found is not None:
+                    subject_found = True
+                    if found:
+                        subject = found
+                    else:
+                        subject_pending = True
+                    # Keep the subject line out of the email body
+                    continue
 
             if not text:
                 html_parts.append("<br>")
@@ -124,6 +161,23 @@ def extract_subject_and_body(docx_path):
 
         # -------- Table --------
         elif isinstance(block, Table):
+
+            # Subject sometimes sits inside a table: "Subject:" | "<text>"
+            if not subject_found:
+                for row in block.rows:
+                    cells = row.cells
+                    for i, cell in enumerate(cells):
+                        found = match_subject(cell.text)
+                        if found is None:
+                            continue
+                        if not found and i + 1 < len(cells):
+                            found = clean_text(cells[i + 1].text)
+                        if found:
+                            subject = found
+                            subject_found = True
+                            break
+                    if subject_found:
+                        break
 
             html_parts.append("<br>")
             html_parts.append(
@@ -293,6 +347,13 @@ def process_emails(folder_path, sender_email, cc_email, bcc_email):
         subject, body_html = extract_subject_and_body(
             os.path.join(letters_path, file)
         )
+
+        if not subject:
+            logs.append(
+                f"⚠️ No subject line found in {file} "
+                f"(expected a line like 'Subject: ...' or 'Sub: ...'); "
+                f"draft created with an empty subject"
+            )
 
         body_html += get_signature_html(sender_email)
 
